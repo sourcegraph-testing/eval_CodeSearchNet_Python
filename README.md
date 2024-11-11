@@ -1,2 +1,2 @@
 # eval-codesearchnet
-Codesearchnet open-source dataset repo for evaluation
+CodesearhNet open-source dataset structured in file-wise format for evaluation-purpose
