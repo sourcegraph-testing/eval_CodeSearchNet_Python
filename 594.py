@@ -1,0 +1,392 @@
+# -*- coding: utf-8 -*-
+"""Parser for Trend Micro Antivirus logs.
+
+Trend Micro uses two log files to track the scans (both manual/scheduled and
+real-time) and the web reputation (network scan/filtering).
+
+Currently only the first log is supported.
+"""
+
+from __future__ import unicode_literals
+
+import codecs
+
+from dfdatetime import definitions as dfdatetime_definitions
+from dfdatetime import posix_time as dfdatetime_posix_time
+from dfdatetime import time_elements as dfdatetime_time_elements
+
+from plaso.containers import events
+from plaso.containers import time_events
+from plaso.lib import errors
+from plaso.lib import definitions
+from plaso.lib import py2to3
+from plaso.formatters import trendmicroav as formatter
+from plaso.parsers import dsv_parser
+from plaso.parsers import manager
+
+
+class TrendMicroAVEventData(events.EventData):
+  """Trend Micro AV Log event data.
+
+  Attributes:
+    action (str): action.
+    filename (str): filename.
+    path (str): path.
+    scan_type (str): scan_type.
+    threat (str): threat.
+  """
+
+  DATA_TYPE = 'av:trendmicro:scan'
+
+  def __init__(self):
+    """Initializes event data."""
+    super(TrendMicroAVEventData, self).__init__(data_type=self.DATA_TYPE)
+    self.action = None
+    self.filename = None
+    self.path = None
+    self.scan_type = None
+    self.threat = None
+
+
+# pylint: disable=abstract-method
+class TrendMicroBaseParser(dsv_parser.DSVParser):
+  """Common code for parsing Trend Micro log files.
+
+  The file format is reminiscent of CSV, but is not quite the same; the
+  delimiter is a three-character sequence and there is no provision for
+  quoting or escaping.
+  """
+
+  DELIMITER = '<;>'
+
+  # Subclasses must define an integer MIN_COLUMNS value.
+  MIN_COLUMNS = None
+
+  # Subclasses must define a list of field names.
+  COLUMNS = ()
+
+  def __init__(self, encoding='cp1252'):
+    """Initializes a parsing Trend Micro log file parser.
+
+    Args:
+      encoding (Optional[str]): encoding used in the DSV file, where None
+          indicates the codepage of the parser mediator should be used.
+    """
+    super(TrendMicroBaseParser, self).__init__(encoding=encoding)
+
+  def _CreateDictReader(self, line_reader):
+    """Iterates over the log lines and provide a reader for the values.
+
+    Args:
+      line_reader (iter): yields each line in the log file.
+
+    Yields:
+      dict[str, str]: column values keyed by column header.
+    """
+    for line in line_reader:
+      if isinstance(line, py2to3.BYTES_TYPE):
+        try:
+          line = codecs.decode(line, self._encoding)
+        except UnicodeDecodeError as exception:
+          raise errors.UnableToParseFile(
+              'Unable decode line with error: {0!s}'.format(exception))
+
+      stripped_line = line.strip()
+      values = stripped_line.split(self.DELIMITER)
+      number_of_values = len(values)
+      number_of_columns = len(self.COLUMNS)
+
+      if number_of_values < self.MIN_COLUMNS:
+        raise errors.UnableToParseFile(
+            'Expected at least {0:d} values, found {1:d}'.format(
+                self.MIN_COLUMNS, number_of_values))
+
+      if number_of_values > number_of_columns:
+        raise errors.UnableToParseFile(
+            'Expected at most {0:d} values, found {1:d}'.format(
+                number_of_columns, number_of_values))
+
+      yield dict(zip(self.COLUMNS, values))
+
+  def _ParseTimestamp(self, parser_mediator, row):
+    """Provides a timestamp for the given row.
+
+    If the Trend Micro log comes from a version that provides a POSIX timestamp,
+    use that directly; it provides the advantages of UTC and of second
+    precision. Otherwise fall back onto the local-timezone date and time.
+
+    Args:
+      parser_mediator (ParserMediator): mediates interactions between parsers
+          and other components, such as storage and dfvfs.
+      row (dict[str, str]): fields of a single row, as specified in COLUMNS.
+
+    Returns:
+      dfdatetime.interface.DateTimeValue: date and time value.
+    """
+    timestamp = row.get('timestamp', None)
+    if timestamp is not None:
+      try:
+        timestamp = int(timestamp, 10)
+      except (ValueError, TypeError):
+        parser_mediator.ProduceExtractionWarning(
+            'Unable to parse timestamp value: {0!s}'.format(timestamp))
+
+      return dfdatetime_posix_time.PosixTime(timestamp=timestamp)
+
+    # The timestamp is not available; parse the local date and time instead.
+    try:
+      return self._ConvertToTimestamp(row['date'], row['time'])
+    except ValueError as exception:
+      parser_mediator.ProduceExtractionWarning((
+          'Unable to parse time string: "{0:s} {1:s}" with error: '
+          '{2!s}').format(repr(row['date']), repr(row['time']), exception))
+
+  def _ConvertToTimestamp(self, date, time):
+    """Converts date and time strings into a timestamp.
+
+    Recent versions of Office Scan write a log field with a Unix timestamp.
+    Older versions may not write this field; their logs only provide a date and
+    a time expressed in the local time zone. This functions handles the latter
+    case.
+
+    Args:
+      date (str): date as an 8-character string in the YYYYMMDD format.
+      time (str): time as a 3 or 4-character string in the [H]HMM format or a
+          6-character string in the HHMMSS format.
+
+    Returns:
+      dfdatetime_time_elements.TimestampElements: the parsed timestamp.
+
+    Raises:
+      ValueError: if the date and time values cannot be parsed.
+    """
+    # Check that the strings have the correct length.
+    if len(date) != 8:
+      raise ValueError(
+          'Unsupported length of date string: {0!s}'.format(repr(date)))
+
+    if len(time) < 3 or len(time) > 4:
+      raise ValueError(
+          'Unsupported length of time string: {0!s}'.format(repr(time)))
+
+    # Extract the date.
+    try:
+      year = int(date[:4], 10)
+      month = int(date[4:6], 10)
+      day = int(date[6:8], 10)
+    except (TypeError, ValueError):
+      raise ValueError('Unable to parse date string: {0!s}'.format(repr(date)))
+
+    # Extract the time. Note that a single-digit hour value has no leading zero.
+    try:
+      hour = int(time[:-2], 10)
+      minutes = int(time[-2:], 10)
+    except (TypeError, ValueError):
+      raise ValueError('Unable to parse time string: {0!s}'.format(repr(date)))
+
+    time_elements_tuple = (year, month, day, hour, minutes, 0)
+    date_time = dfdatetime_time_elements.TimeElements(
+        time_elements_tuple=time_elements_tuple)
+    date_time.is_local_time = True
+    # TODO: add functionality to dfdatetime to control precision.
+    date_time._precision = dfdatetime_definitions.PRECISION_1_MINUTE  # pylint: disable=protected-access
+
+    return date_time
+
+
+class OfficeScanVirusDetectionParser(TrendMicroBaseParser):
+  """Parses the Trend Micro Office Scan Virus Detection Log."""
+
+  NAME = 'trendmicro_vd'
+  DESCRIPTION = 'Parser for Trend Micro Office Scan Virus Detection log files.'
+
+  COLUMNS = [
+      'date', 'time', 'threat', 'action', 'scan_type', 'unused1',
+      'path', 'filename', 'unused2', 'timestamp', 'unused3', 'unused4']
+  MIN_COLUMNS = 8
+
+  def ParseRow(self, parser_mediator, row_offset, row):
+    """Parses a line of the log file and produces events.
+
+    Args:
+      parser_mediator (ParserMediator): mediates interactions between parsers
+          and other components, such as storage and dfvfs.
+      row_offset (int): line number of the row.
+      row (dict[str, str]): fields of a single row, as specified in COLUMNS.
+    """
+    timestamp = self._ParseTimestamp(parser_mediator, row)
+    if timestamp is None:
+      return
+
+    try:
+      action = int(row['action'], 10)
+    except (ValueError, TypeError):
+      action = None
+
+    try:
+      scan_type = int(row['scan_type'], 10)
+    except (ValueError, TypeError):
+      scan_type = None
+
+    event_data = TrendMicroAVEventData()
+    event_data.action = action
+    event_data.filename = row['filename']
+    event_data.offset = row_offset
+    event_data.path = row['path']
+    event_data.scan_type = scan_type
+    event_data.threat = row['threat']
+
+    event = time_events.DateTimeValuesEvent(
+        timestamp, definitions.TIME_DESCRIPTION_WRITTEN)
+    parser_mediator.ProduceEventWithEventData(event, event_data)
+
+  def VerifyRow(self, parser_mediator, row):
+    """Verifies if a line of the file is in the expected format.
+
+    Args:
+      parser_mediator (ParserMediator): mediates interactions between parsers
+          and other components, such as storage and dfvfs.
+      row (dict[str, str]): fields of a single row, as specified in COLUMNS.
+
+    Returns:
+      bool: True if this is the correct parser, False otherwise.
+    """
+    if len(row) < self.MIN_COLUMNS:
+      return False
+
+    # Check the date format!
+    # If it doesn't parse, then this isn't a Trend Micro AV log.
+    try:
+      timestamp = self._ConvertToTimestamp(row['date'], row['time'])
+    except (ValueError, TypeError):
+      return False
+
+    if timestamp is None:
+      return False
+
+    # Check that the action value is plausible.
+    try:
+      action = int(row['action'], 10)
+    except (ValueError, TypeError):
+      return False
+
+    if action not in formatter.SCAN_RESULTS:
+      return False
+    return True
+
+
+class TrendMicroUrlEventData(events.EventData):
+  """Trend Micro Web Reputation Log event data.
+
+  Attributes:
+    block_mode (str): operation mode.
+    url (str): accessed URL.
+    group_code (str): group code.
+    group_name (str): group name.
+    credibility_rating (int): credibility rating.
+    credibility_score (int): credibility score.
+    policy_identifier (int): policy identifier.
+    application_name (str): application name.
+    ip (str): IP address.
+    threshold (int): threshold value.
+  """
+  DATA_TYPE = 'av:trendmicro:webrep'
+
+  def __init__(self):
+    """Initializes event data."""
+    super(TrendMicroUrlEventData, self).__init__(data_type=self.DATA_TYPE)
+    self.block_mode = None
+    self.url = None
+    self.group_code = None
+    self.group_name = None
+    self.credibility_rating = None
+    self.credibility_score = None
+    self.policy_identifier = None
+    self.application_name = None
+    self.ip = None
+    self.threshold = None
+
+
+class OfficeScanWebReputationParser(TrendMicroBaseParser):
+  """Parses the Trend Micro Office Scan Web Reputation detection log."""
+  NAME = 'trendmicro_url'
+  DESCRIPTION = 'Parser for Trend Micro Office Web Reputation log files.'
+
+  COLUMNS = (
+      'date', 'time', 'block_mode', 'url', 'group_code', 'group_name',
+      'credibility_rating', 'policy_identifier', 'application_name',
+      'credibility_score', 'ip', 'threshold', 'timestamp', 'unused')
+
+  MIN_COLUMNS = 12
+
+  def ParseRow(self, parser_mediator, row_offset, row):
+    """Parses a line of the log file and produces events.
+
+    Args:
+      parser_mediator (ParserMediator): mediates interactions between parsers
+          and other components, such as storage and dfvfs.
+      row_offset (int): line number of the row.
+      row (dict[str, str]): fields of a single row, as specified in COLUMNS.
+    """
+    timestamp = self._ParseTimestamp(parser_mediator, row)
+    if timestamp is None:
+      return
+
+    event_data = TrendMicroUrlEventData()
+    event_data.offset = row_offset
+
+    # Convert and store integer values.
+    for field in (
+        'credibility_rating', 'credibility_score', 'policy_identifier',
+        'threshold', 'block_mode'):
+      try:
+        value = int(row[field], 10)
+      except (ValueError, TypeError):
+        value = None
+      setattr(event_data, field, value)
+
+    # Store string values.
+    for field in ('url', 'group_name', 'group_code', 'application_name', 'ip'):
+      setattr(event_data, field, row[field])
+
+    event = time_events.DateTimeValuesEvent(
+        timestamp, definitions.TIME_DESCRIPTION_WRITTEN)
+    parser_mediator.ProduceEventWithEventData(event, event_data)
+
+  def VerifyRow(self, parser_mediator, row):
+    """Verifies if a line of the file is in the expected format.
+
+    Args:
+      parser_mediator (ParserMediator): mediates interactions between parsers
+          and other components, such as storage and dfvfs.
+      row (dict[str, str]): fields of a single row, as specified in COLUMNS.
+
+    Returns:
+      bool: True if this is the correct parser, False otherwise.
+    """
+    if len(row) < self.MIN_COLUMNS:
+      return False
+
+    # Check the date format!
+    # If it doesn't parse, then this isn't a Trend Micro AV log.
+    try:
+      timestamp = self._ConvertToTimestamp(row['date'], row['time'])
+    except ValueError:
+      return False
+
+    if timestamp is None:
+      return False
+
+    try:
+      block_mode = int(row['block_mode'], 10)
+    except (ValueError, TypeError):
+      return False
+
+    if block_mode not in formatter.BLOCK_MODES:
+      return False
+    return True
+
+
+manager.ParsersManager.RegisterParsers([
+    OfficeScanVirusDetectionParser,
+    OfficeScanWebReputationParser])
